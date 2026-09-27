@@ -13,9 +13,9 @@ _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 _OPTIONAL_PATH = re.compile(r"\s+\(ignore_errors=(?:yes|no)\)")
 
 
-def _directive_words(value: str) -> list[str]:
-    words = systemd_words(value)
-    return words if words else [""]
+def _directive_words(value: str) -> tuple[list[str], bool]:
+    words, exact = systemd_words_with_status(value)
+    return (words if words else [""]), exact
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class SourceRef:
     optional: bool = False
     declared_in: str | None = None
     declared_line: int | None = None
+    resolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class Assignment:
     source: str
     line: int | None
     modified_since_start: bool | None = None
+    value: str | None = None
+    value_known: bool = False
 
 
 @dataclass
@@ -50,43 +53,103 @@ def systemd_words(value: str) -> list[str]:
     This intentionally handles only what source discovery needs. It does not
     claim to emulate all systemd specifier or escape processing.
     """
+    words, _exact = systemd_words_with_status(value)
+    return words
+
+
+def systemd_words_with_status(value: str) -> tuple[list[str], bool]:
+    """Split systemd words and report whether all syntax was understood."""
     words: list[str] = []
     current: list[str] = []
     quote: str | None = None
     started = False
+    quote_just_closed = False
+    exact = True
     index = 0
-    escapes = {"s": " ", "t": "\t", "n": "\n", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+    escapes = {
+        "a": "\a",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "s": " ",
+        "\\": "\\",
+        '"': '"',
+        "'": "'",
+    }
     while index < len(value):
         char = value[index]
         if char == "\\":
             if index + 1 >= len(value):
                 current.append("\\")
+                exact = False
                 started = True
                 index += 1
                 continue
             next_char = value[index + 1]
-            if next_char == "x" and index + 3 < len(value):
-                digits = value[index + 2 : index + 4]
+            digits: str | None = None
+            digit_count = 0
+            base = 16
+            escaped_prefix_length = 1
+            if next_char == "x":
+                digit_count = 2
+                escaped_prefix_length = 2
+                digits = value[index + 2 : index + 2 + digit_count]
+            elif next_char == "u":
+                digit_count = 4
+                escaped_prefix_length = 2
+                digits = value[index + 2 : index + 2 + digit_count]
+            elif next_char == "U":
+                digit_count = 8
+                escaped_prefix_length = 2
+                digits = value[index + 2 : index + 2 + digit_count]
+            elif next_char in "01234567" and index + 3 < len(value):
+                base = 8
+                digit_count = 3
+                digits = value[index + 1 : index + 1 + digit_count]
+            if digits is not None and len(digits) == digit_count:
                 try:
-                    current.append(chr(int(digits, 16)))
-                    index += 4
+                    codepoint = int(digits, base)
+                    if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                        raise ValueError
+                    if (next_char == "x" or base == 8) and codepoint > 0x7F:
+                        # Byte escapes above ASCII cannot be compared safely
+                        # with Unicode decoded from procfs.
+                        exact = False
+                    current.append(chr(codepoint))
+                    index += escaped_prefix_length + digit_count
                     started = True
+                    quote_just_closed = False
                     continue
                 except ValueError:
-                    pass
-            current.append(escapes.get(next_char, next_char))
+                    exact = False
+            elif next_char in escapes:
+                current.append(escapes[next_char])
+                index += 2
+                started = True
+                quote_just_closed = False
+                continue
+            else:
+                exact = False
+            current.extend(("\\", next_char))
             started = True
             index += 2
+            quote_just_closed = False
             continue
         if quote is not None:
             if char == quote:
                 quote = None
+                quote_just_closed = True
             else:
                 current.append(char)
             started = True
             index += 1
             continue
         if char in {"'", '"'}:
+            if started:
+                exact = False
             quote = char
             started = True
         elif char.isspace():
@@ -94,13 +157,19 @@ def systemd_words(value: str) -> list[str]:
                 words.append("".join(current))
                 current.clear()
                 started = False
+            quote_just_closed = False
         else:
+            if quote_just_closed:
+                exact = False
             current.append(char)
             started = True
+            quote_just_closed = False
         index += 1
     if started:
         words.append("".join(current))
-    return words
+    if quote is not None:
+        exact = False
+    return words, exact
 
 
 def _logical_lines(text: str):
@@ -118,6 +187,8 @@ def _logical_lines(text: str):
             source_line = 0
             continue
         source_line += 1
+        if pending is not None and raw_line.lstrip().startswith(("#", ";")):
+            continue
         stripped = raw_line.rstrip()
         trailing_backslashes = len(stripped) - len(stripped.rstrip("\\"))
         continuation = trailing_backslashes % 2 == 1
@@ -126,7 +197,7 @@ def _logical_lines(text: str):
             pending = fragment
             pending_line = source_line
         else:
-            pending += fragment.lstrip()
+            pending += " " + fragment
         if not continuation:
             yield source, pending_line, pending
             pending = None
@@ -158,15 +229,35 @@ def parse_unit_cat(text: str) -> ParsedUnit:
         location = source or "unit configuration"
 
         if key == "Environment":
-            for assignment in _directive_words(value):
+            assignments, syntax_exact = _directive_words(value)
+            if not syntax_exact:
+                warnings.append("some Environment= values could not be parsed exactly")
+            for assignment in assignments:
                 if assignment == "":
                     environment.clear()
                     continue
-                name, separator, _assigned_value = assignment.partition("=")
+                name, separator, assigned_value = assignment.partition("=")
                 if separator and _NAME.fullmatch(name):
-                    environment.append(Assignment(name, "Environment=", location, line_number))
+                    environment.append(
+                        Assignment(
+                            name,
+                            "Environment=",
+                            location,
+                            line_number,
+                            value=assigned_value,
+                            value_known=(
+                                syntax_exact
+                                and "%" not in assigned_value
+                                and all(char.isprintable() for char in assigned_value)
+                            ),
+                        )
+                    )
         elif key == "EnvironmentFile":
-            for path in _directive_words(value):
+            paths, syntax_exact = _directive_words(value)
+            if not syntax_exact:
+                warnings.append("some EnvironmentFile paths could not be parsed exactly")
+                continue
+            for path in paths:
                 if path == "":
                     environment_files.clear()
                     continue
@@ -177,13 +268,19 @@ def parse_unit_cat(text: str) -> ParsedUnit:
                         SourceRef(actual_path, optional, location, line_number)
                     )
         elif key == "PassEnvironment":
-            for name in _directive_words(value):
+            names, syntax_exact = _directive_words(value)
+            if not syntax_exact:
+                warnings.append("some PassEnvironment names could not be parsed exactly")
+            for name in names:
                 if name == "":
                     pass_environment.clear()
                 elif _NAME.fullmatch(name):
                     pass_environment.add(name)
         elif key == "UnsetEnvironment":
-            for item in _directive_words(value):
+            items, syntax_exact = _directive_words(value)
+            if not syntax_exact:
+                warnings.append("some UnsetEnvironment entries could not be parsed exactly")
+            for item in items:
                 if item == "":
                     unset_environment.clear()
                 else:
@@ -194,10 +291,24 @@ def parse_unit_cat(text: str) -> ParsedUnit:
 
 def parse_systemd_environment_property(value: str, kind: str) -> list[Assignment]:
     assignments: list[Assignment] = []
-    for item in systemd_words(value):
-        name, separator, _assigned_value = item.partition("=")
+    items, syntax_exact = systemd_words_with_status(value)
+    for item in items:
+        name, separator, assigned_value = item.partition("=")
         if separator and _NAME.fullmatch(name):
-            assignments.append(Assignment(name, kind, "loaded systemd unit property", None))
+            assignments.append(
+                Assignment(
+                    name,
+                    kind,
+                    "loaded systemd unit property",
+                    None,
+                    value=assigned_value,
+                    value_known=(
+                        syntax_exact
+                        and "%" not in assigned_value
+                        and all(char.isprintable() for char in assigned_value)
+                    ),
+                )
+            )
     return assignments
 
 
@@ -214,38 +325,116 @@ def parse_unset_property(value: str) -> list[str]:
     return systemd_words(value)
 
 
-def environment_file_names(content: str):
-    """Yield assignment names while skipping quoted and escaped continuations."""
+def _parse_environment_file_value(
+    lines: list[str], start: int, right_hand_side: str
+) -> tuple[str | None, int, bool]:
+    """Parse one systemd EnvironmentFile value, returning its next line index."""
+    leading_trimmed = right_hand_side.lstrip(" \t\r")
     quote: str | None = None
-    continued = False
-    for line_number, line in enumerate(content.splitlines(), start=1):
-        stripped = line.lstrip()
-        if quote is None and not continued and stripped and not stripped.startswith(("#", ";")):
-            assignment = _ASSIGNMENT.match(stripped)
-            if assignment:
-                yield assignment.group(1), line_number
+    if leading_trimmed.startswith(("'", '"')):
+        quote = leading_trimmed[0]
+        pieces: list[str] = []
+        text = leading_trimmed[1:]
+        line_index = start
+        while True:
+            index = 0
+            continuation = False
+            while index < len(text):
+                char = text[index]
+                if quote == "'":
+                    if char == "'":
+                        remainder = text[index + 1 :]
+                        if remainder.strip(" \t\r"):
+                            return None, line_index + 1, False
+                        return "".join(pieces), line_index + 1, True
+                    pieces.append(char)
+                    index += 1
+                    continue
 
-        if quote is None and not continued and stripped.startswith(("#", ";")):
+                if char == '"':
+                    remainder = text[index + 1 :]
+                    if remainder.strip(" \t\r"):
+                        return None, line_index + 1, False
+                    return "".join(pieces), line_index + 1, True
+                if char == "\\":
+                    if index + 1 < len(text):
+                        following = text[index + 1]
+                        if following in {'"', "\\", "`", "$"}:
+                            pieces.append(following)
+                        else:
+                            pieces.extend(("\\", following))
+                        index += 2
+                        continue
+                    continuation = True
+                    break
+                pieces.append(char)
+                index += 1
+
+            if line_index + 1 >= len(lines):
+                return None, line_index + 1, False
+            if not continuation:
+                pieces.append("\n")
+            line_index += 1
+            text = lines[line_index]
+
+    # In an unquoted value, only a backslash at the very end continues the
+    # physical line. Quotes after the first non-whitespace character are data.
+    pieces = []
+    line_index = start
+    text = leading_trimmed
+    while True:
+        continuation = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char == "\\":
+                if index + 1 < len(text):
+                    pieces.append(text[index + 1])
+                    index += 2
+                    continue
+                continuation = True
+                break
+            pieces.append(char)
+            index += 1
+        if not continuation:
+            break
+        if line_index + 1 >= len(lines):
+            return None, line_index + 1, False
+        line_index += 1
+        text = lines[line_index]
+    return "".join(pieces).strip(" \t\r"), line_index + 1, True
+
+
+def environment_file_assignments(
+    content: str, requested_name: str
+) -> tuple[list[tuple[int, str | None]], bool]:
+    """Return a name's current values and whether any value syntax was unclear."""
+    lines = content.split("\n")
+    matches: list[tuple[int, str | None]] = []
+    had_unparsed_value = False
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+        stripped = line.lstrip(" \t\r")
+        if not stripped or stripped.startswith(("#", ";")):
+            line_index += 1
+            continue
+        assignment = _ASSIGNMENT.match(stripped)
+        if assignment is None:
+            line_index += 1
             continue
 
-        escaped = False
-        for char in line:
-            if escaped:
-                escaped = False
-                continue
-            if char == "\\":
-                escaped = True
-            elif quote is not None:
-                if char == quote:
-                    quote = None
-            elif char in {"'", '"'}:
-                quote = char
-
-        trailing_backslashes = len(line) - len(line.rstrip("\\"))
-        continued = trailing_backslashes % 2 == 1
-        if continued:
-            # The final backslash escapes the physical newline itself.
-            escaped = False
+        name = assignment.group(1)
+        equals_index = assignment.end() - 1
+        value, next_line, parsed = _parse_environment_file_value(
+            lines, line_index, stripped[equals_index + 1 :]
+        )
+        if not parsed:
+            had_unparsed_value = True
+        if name == requested_name:
+            matches.append((line_index + 1, value if parsed else None))
+        line_index = max(line_index + 1, next_line)
+    return matches, had_unparsed_value
 
 
 def parse_environment_files_property(value: str) -> list[SourceRef] | None:
@@ -257,10 +446,16 @@ def parse_environment_files_property(value: str) -> list[SourceRef] | None:
     found = False
     for match in _OPTIONAL_PATH.finditer(value):
         segment = value[start : match.start()].strip()
-        words = systemd_words(segment)
+        words, syntax_exact = systemd_words_with_status(segment)
+        if not syntax_exact:
+            return None
         if words:
-            path = words[-1]
-            refs.append(SourceRef(path, "yes" in match.group(0), "loaded unit property", None))
+            if len(words) != 1:
+                return None
+            path = words[0]
+            refs.append(
+                SourceRef(path, "yes" in match.group(0), "loaded unit property", None, True)
+            )
             found = True
         start = match.end()
     if not found:
@@ -286,7 +481,7 @@ def find_assignments(
     candidates.extend(item for item in loaded_environment if item.name == name)
 
     for source in environment_files:
-        paths = _expand_path(source.path)
+        paths = _expand_path(source)
         if not paths:
             if not source.optional:
                 warnings.append(f"could not resolve EnvironmentFile path {source.path!r}")
@@ -305,6 +500,9 @@ def find_assignments(
             except UnicodeError:
                 warnings.append(f"EnvironmentFile is not valid UTF-8: {path}")
                 continue
+            if "\0" in content or "\ufeff" in content:
+                warnings.append(f"EnvironmentFile contains invalid NUL or BOM characters: {path}")
+                continue
 
             changed_since_start: bool | None = None
             try:
@@ -313,18 +511,44 @@ def find_assignments(
             except OSError:
                 pass
 
-            for assignment_name, line_number in environment_file_names(content):
-                if assignment_name == name:
+            file_assignments, had_unparsed_value = environment_file_assignments(content, name)
+            if had_unparsed_value:
+                warnings.append(f"some EnvironmentFile values could not be parsed exactly: {path}")
+            for line_number, assigned_value in file_assignments:
+                if assigned_value is not None:
                     candidates.append(
-                        Assignment(name, "EnvironmentFile=", str(path), line_number, changed_since_start)
+                        Assignment(
+                            name,
+                            "EnvironmentFile=",
+                            str(path),
+                            line_number,
+                            changed_since_start,
+                            assigned_value,
+                            True,
+                        )
+                    )
+                else:
+                    candidates.append(
+                        Assignment(
+                            name,
+                            "EnvironmentFile=",
+                            str(path),
+                            line_number,
+                            changed_since_start,
+                        )
                     )
 
     unset_mentions_name = _unset_mentions_name(name, parsed.unset_environment)
     return candidates, warnings, unset_mentions_name
 
 
-def _expand_path(path: str) -> list[str]:
-    if not path.startswith("/") or any(token in path for token in ("%", "$")):
+def _expand_path(source: SourceRef) -> list[str]:
+    path = source.path
+    if not path.startswith("/"):
+        return []
+    if source.resolved:
+        return [path]
+    if "%" in path:
         return []
     if glob.has_magic(path):
         return sorted(glob.glob(path))

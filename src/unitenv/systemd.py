@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+
 class InspectionError(RuntimeError):
     """An expected error while inspecting the local system."""
 
@@ -40,6 +41,7 @@ _PROPERTIES = (
     "UnsetEnvironment",
     "PAMName",
 )
+_SAFE_MANAGER_VALUE = re.compile(r"^[A-Za-z0-9_.,:/@%+=-]*$")
 
 
 def _systemctl(*arguments: str, timeout: float = 15.0) -> str:
@@ -120,14 +122,18 @@ def cat_unit(name: str) -> str:
     return _systemctl("cat", "--no-pager", name)
 
 
-def manager_environment_has(name: str) -> bool:
-    """Check one name in the system manager block without displaying values."""
+def manager_environment_value(name: str) -> tuple[bool, str | None, bool]:
+    """Inspect one manager variable; return presence, parsed value, and certainty."""
     output = _systemctl("show-environment")
     for line in output.splitlines():
-        variable, separator, _value = line.partition("=")
+        variable, separator, raw_value = line.partition("=")
         if separator and variable == name:
-            return True
-    return False
+            # systemctl prints this block in shell-compatible form. Compare
+            # only plain characters that need no shell unescaping.
+            if _SAFE_MANAGER_VALUE.fullmatch(raw_value):
+                return True, raw_value, True
+            return True, None, False
+    return False, None, True
 
 
 def read_process_variable(pid: int, requested_name: str) -> bytes | None:

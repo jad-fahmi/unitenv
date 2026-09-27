@@ -20,7 +20,7 @@ from .systemd import (
     Unit,
     cat_unit,
     inspect_unit,
-    manager_environment_has,
+    manager_environment_value,
     process_start_time,
     read_process_variable,
 )
@@ -43,16 +43,25 @@ def _configured_sources(
     if loaded_files is None:
         environment_files = parsed.environment_files
     else:
-        environment_files = loaded_files
+        environment_files = []
+        seen_paths: set[str] = set()
+        for source in [*loaded_files, *parsed.environment_files]:
+            if source.path not in seen_paths:
+                environment_files.append(source)
+                seen_paths.add(source.path)
 
     if "PassEnvironment" in properties:
         pass_names = parse_name_list_property(properties["PassEnvironment"])
+        pass_names.update(parsed.pass_environment)
     else:
         pass_names = parsed.pass_environment
 
     unset_property_available = "UnsetEnvironment" in properties
     if unset_property_available:
         unset_match = unset_property_mentions_name(name, properties["UnsetEnvironment"])
+        unset_match = unset_match or unset_property_mentions_name(
+            name, " ".join(parsed.unset_environment)
+        )
     else:
         unset_match = unset_property_mentions_name(name, " ".join(parsed.unset_environment))
 
@@ -94,17 +103,30 @@ def explain(unit_name: str, variable: str, reveal: bool = False) -> tuple[dict[s
         warnings.append("could not determine the main process start time for file timestamp comparisons")
 
     manager_has_variable: bool | None = None
+    manager_value: str | None = None
+    manager_value_known = False
     if passed:
         try:
-            manager_has_variable = manager_environment_has(variable)
+            manager_has_variable, manager_value, manager_value_known = manager_environment_value(variable)
         except InspectionError:
             warnings.append("could not inspect the system manager environment for the requested name")
 
     pam_name = unit.properties.get("PAMName", "")
     source_rows = []
-    seen: set[tuple[str, str, int | None]] = set()
+    seen: set[tuple[str, str, int | None, str | None, bool]] = set()
+    process_text = (
+        process_value.decode("utf-8", errors="surrogateescape")
+        if process_value is not None
+        else None
+    )
     for candidate in candidates:
-        identity = (candidate.kind, candidate.source, candidate.line)
+        identity = (
+            candidate.kind,
+            candidate.source,
+            candidate.line,
+            candidate.value,
+            candidate.value_known,
+        )
         if identity in seen:
             continue
         seen.add(identity)
@@ -115,18 +137,79 @@ def explain(unit_name: str, variable: str, reveal: bool = False) -> tuple[dict[s
         }
         if candidate.modified_since_start is not None:
             row["modified_since_process_start"] = candidate.modified_since_start
+        if process_text is None:
+            row["comparison"] = "not compared; variable absent from process snapshot"
+        elif not candidate.value_known or candidate.value is None:
+            row["comparison"] = "not compared; source value could not be parsed exactly"
+        elif candidate.value == process_text:
+            row["comparison"] = "matches process snapshot"
+        else:
+            row["comparison"] = "differs from process snapshot"
         source_rows.append(row)
 
+    manager_comparison: str | None = None
+    if manager_has_variable is True:
+        if process_text is None:
+            manager_comparison = "not compared; variable absent from process snapshot"
+        elif not manager_value_known or manager_value is None:
+            manager_comparison = "not compared; manager value could not be parsed exactly"
+        elif manager_value == process_text:
+            manager_comparison = "matches process snapshot"
+        else:
+            manager_comparison = "differs from process snapshot"
+
     if present:
-        assessment = (
-            "present in the main process snapshot; listed assignments are candidates, "
-            "not proven historical sources"
+        matching = sum(
+            row["comparison"] == "matches process snapshot" for row in source_rows
         )
-    elif candidates or passed:
+        comparable = sum(
+            row["comparison"] in {
+                "matches process snapshot",
+                "differs from process snapshot",
+            }
+            for row in source_rows
+        )
+        if matching:
+            matched_sources = f"{matching} current assignment candidate(s)"
+            if manager_comparison == "matches process snapshot":
+                matched_sources += " and the system manager environment"
+            assessment = (
+                f"present; its value matches {matched_sources}, "
+                "but a matching value does not prove a unique historical source"
+            )
+        elif manager_comparison == "matches process snapshot" and comparable:
+            assessment = (
+                "present; the value matches the manager environment passed by PassEnvironment, "
+                "while comparable current unit assignments differ"
+            )
+        elif comparable:
+            assessment = (
+                "present; none of the comparable current assignment values match; "
+                "precedence, launch-time changes, or another source may explain it"
+            )
+        elif manager_comparison == "matches process snapshot":
+            assessment = (
+                "present; its value matches the system manager environment passed by "
+                "PassEnvironment, but a unique historical source is not proven"
+            )
+        elif source_rows:
+            assessment = "present; current assignments were found, but their values could not be compared"
+        else:
+            assessment = "present in the main process snapshot; no current assignment candidate was found"
+    elif candidates:
         assessment = (
-            "absent from the main process snapshot despite a current assignment or "
-            "PassEnvironment rule; "
+            "absent from the main process snapshot despite a current assignment; "
             "loaded and launch-time state may differ"
+        )
+    elif passed and manager_has_variable is True:
+        assessment = (
+            "absent from the main process snapshot although PassEnvironment and the system "
+            "manager contain the name; loaded or launch-time state may differ"
+        )
+    elif passed:
+        assessment = (
+            "absent from the main process snapshot; PassEnvironment lists the name, but "
+            "the manager value is absent or unavailable"
         )
     else:
         assessment = "absent from the main process snapshot; no matching current assignment was found"
@@ -158,6 +241,7 @@ def explain(unit_name: str, variable: str, reveal: bool = False) -> tuple[dict[s
         "manager_environment": {
             "passed_by_pass_environment": passed,
             "name_present": manager_has_variable,
+            "comparison": manager_comparison,
         },
         "assessment": assessment,
         "warnings": warnings,

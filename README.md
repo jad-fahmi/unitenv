@@ -17,9 +17,9 @@ Variable:         API_ENDPOINT
 Process snapshot: present (value hidden)
 Need daemon reload: no
 Current assignments:
-  - /etc/myapp/runtime.env:4 (EnvironmentFile=; file not newer than process start)
+  - /etc/myapp/runtime.env:4 (EnvironmentFile=; matches process snapshot; file not newer than process start)
 PassEnvironment:  requested name is not listed
-Assessment:       present in the main process snapshot; listed assignments are candidates, not proven historical sources
+Assessment:       present; its value matches 1 current assignment candidate(s), but a matching value does not prove a unique historical source
 ```
 
 The command correlates systemd's loaded unit properties, the unit files
@@ -69,6 +69,10 @@ commands. It contains `process_snapshot.present`, the `current_assignments`
 candidate list, loaded configuration indicators, an assessment, and warnings.
 Without `--reveal`, the process value is omitted and
 `process_snapshot.value_redacted` is `true` when the variable is present.
+Each current assignment includes a value comparison when `unitenv` can parse it
+exactly. `manager_environment.comparison` reports the same check for a simple
+value passed through `PassEnvironment=`. Configured values themselves are never
+included in the report.
 
 Exit status:
 
@@ -112,8 +116,8 @@ files, or make network requests while diagnosing a service.
   Multiple assignments can use the same name, environment-file values override
   `Environment=` values, and `UnsetEnvironment=` is applied last. Manager,
   PAM, and systemd-generated variables can also affect the result. Source
-  discovery matches names; it does not emulate every systemd expansion or
-  compare every configured value with the process value.
+  discovery compares values only when it can parse them exactly; it does not
+  emulate every systemd expansion or establish which bytes were used at launch.
 - The first release targets active system services managed by the system
   manager. User-manager units, worker-process selection, and complete parsing
   of every systemd syntax edge case are outside its supported scope.

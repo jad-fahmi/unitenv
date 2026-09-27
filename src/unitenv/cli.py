@@ -73,6 +73,9 @@ def _format_human(report: dict) -> str:
             if candidate["line"] is not None:
                 location += f":{candidate['line']}"
             details = candidate["kind"]
+            comparison = candidate.get("comparison")
+            if comparison:
+                details += f"; {comparison}"
             if candidate.get("modified_since_process_start") is True:
                 details += "; file newer than process start"
             elif candidate.get("modified_since_process_start") is False:
@@ -83,9 +86,16 @@ def _format_human(report: dict) -> str:
 
     manager = report["manager_environment"]
     if manager["passed_by_pass_environment"]:
-        manager_status = "present" if manager["name_present"] else "absent or unavailable"
+        if manager["name_present"] is True:
+            manager_status = "present"
+        elif manager["name_present"] is False:
+            manager_status = "absent"
+        else:
+            manager_status = "unavailable"
+        if manager["comparison"]:
+            manager_status += f"; {manager['comparison']}"
         lines.append(
-            f"PassEnvironment:  requested name is listed; manager value is {manager_status}"
+            f"PassEnvironment:  requested name is listed; manager name is {manager_status}"
         )
     else:
         lines.append("PassEnvironment:  requested name is not listed")
