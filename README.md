@@ -11,11 +11,15 @@ value.
 ```console
 $ unitenv explain myapp.service --key API_ENDPOINT
 Unit:             myapp.service
-Main PID:         2418 (running)
+State:            active/running
+Main PID:         2418
 Variable:         API_ENDPOINT
 Process snapshot: present (value hidden)
-Current config:   /etc/myapp/runtime.env:4 (EnvironmentFile=)
-Assessment:       a current assignment is a candidate source; provenance is not proven
+Need daemon reload: no
+Current assignments:
+  - /etc/myapp/runtime.env:4 (EnvironmentFile=; file not newer than process start)
+PassEnvironment:  requested name is not listed
+Assessment:       present in the main process snapshot; listed assignments are candidates, not proven historical sources
 ```
 
 The command correlates systemd's loaded unit properties, the unit files
@@ -61,7 +65,10 @@ unitenv explain api.service --key DATABASE_URL --reveal
 `--reveal` prints the requested value when it is present in the process
 snapshot. Treat that output as sensitive. Human-readable and JSON output both
 hide values by default. The JSON format is intended for scripts and diagnostic
-commands; its fields are documented in the `unitenv explain --help` text.
+commands. It contains `process_snapshot.present`, the `current_assignments`
+candidate list, loaded configuration indicators, an assessment, and warnings.
+Without `--reveal`, the process value is omitted and
+`process_snapshot.value_redacted` is `true` when the variable is present.
 
 Exit status:
 
@@ -104,7 +111,9 @@ files, or make network requests while diagnosing a service.
 - A matching assignment is a **candidate source**, not proof of provenance.
   Multiple assignments can use the same name, environment-file values override
   `Environment=` values, and `UnsetEnvironment=` is applied last. Manager,
-  PAM, and systemd-generated variables can also affect the result.
+  PAM, and systemd-generated variables can also affect the result. Source
+  discovery matches names; it does not emulate every systemd expansion or
+  compare every configured value with the process value.
 - The first release targets active system services managed by the system
   manager. User-manager units, worker-process selection, and complete parsing
   of every systemd syntax edge case are outside its supported scope.
@@ -113,6 +122,8 @@ The source and precedence rules are described in the upstream
 [systemd execution environment documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
 The meaning and access restrictions of the process snapshot are described in
 [`proc_pid_environ(5)`](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html).
+Environment variables are not a secure secret store; systemd recommends its
+credential mechanisms for passing sensitive data to services.
 
 ## Development
 
