@@ -93,6 +93,9 @@ def inspect_unit(name: str) -> Unit:
     load_state = properties.get("LoadState", "")
     if load_state != "loaded":
         raise InspectionError(f"unit {name!r} is not loaded by the system manager")
+    active_state = properties.get("ActiveState", "unknown")
+    if active_state not in {"active", "reloading"}:
+        raise InspectionError(f"unit {name!r} is not active (state: {active_state})")
     try:
         main_pid = int(properties.get("MainPID", "0"))
     except ValueError as exc:
@@ -110,7 +113,7 @@ def inspect_unit(name: str) -> Unit:
     return Unit(
         name=properties.get("Id", name),
         load_state=load_state,
-        active_state=properties.get("ActiveState", "unknown"),
+        active_state=active_state,
         sub_state=properties.get("SubState", "unknown"),
         main_pid=main_pid,
         need_daemon_reload=need_reload,
