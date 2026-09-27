@@ -226,6 +226,7 @@ def explain(unit_name: str, variable: str, reveal: bool = False) -> tuple[dict[s
         )
 
     result: dict[str, Any] = {
+        "schema_version": 1,
         "unit": unit.name,
         "state": f"{unit.active_state}/{unit.sub_state}",
         "main_pid": unit.main_pid,

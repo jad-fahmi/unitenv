@@ -65,8 +65,9 @@ unitenv explain api.service --key DATABASE_URL --reveal
 `--reveal` prints the requested value when it is present in the process
 snapshot. Treat that output as sensitive. Human-readable and JSON output both
 hide values by default. The JSON format is intended for scripts and diagnostic
-commands. It contains `process_snapshot.present`, the `current_assignments`
-candidate list, loaded configuration indicators, an assessment, and warnings.
+commands. It includes `schema_version` and contains
+`process_snapshot.present`, the `current_assignments` candidate list, loaded
+configuration indicators, an assessment, and warnings.
 Without `--reveal`, the process value is omitted and
 `process_snapshot.value_redacted` is `true` when the variable is present.
 Each current assignment includes a value comparison when `unitenv` can parse it
