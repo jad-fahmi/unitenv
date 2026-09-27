@@ -8,5 +8,7 @@
 - Compare the requested process value with current assignments when their
   syntax can be parsed exactly, without printing configured values.
 - Version the JSON report schema.
+- Distinguish confirmed matches, missing names, source mismatches, and drift hints
+  with documented exit statuses.
 - Redact the requested value by default and provide JSON output.
 - Add project documentation, packaging metadata, and the MIT license.

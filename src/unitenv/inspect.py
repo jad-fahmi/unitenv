@@ -255,4 +255,18 @@ def explain(unit_name: str, variable: str, reveal: bool = False) -> tuple[dict[s
         else:
             result["process_snapshot"]["value_redacted"] = True
 
-    return result, 0 if present else 3
+    if not present:
+        exit_status = 3
+    else:
+        has_match = any(
+            row["comparison"] == "matches process snapshot" for row in source_rows
+        ) or manager_comparison == "matches process snapshot"
+        possible_drift = need_reload is True or any(
+            candidate.modified_since_start is True for candidate in candidates
+        )
+        if possible_drift:
+            exit_status = 4
+        else:
+            exit_status = 0 if has_match else 1
+
+    return result, exit_status

@@ -79,9 +79,11 @@ Exit status:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | The variable is present in the main process's initial environment snapshot. |
+| `0` | The variable is present and at least one comparable current source candidate matches, with no known drift hint. |
+| `1` | The variable is present, but no current source value could be confirmed as a match. |
 | `2` | The unit could not be inspected, the process snapshot could not be read, or command usage is invalid. |
 | `3` | The variable is absent from the main process's initial environment snapshot. |
+| `4` | The variable is present, but systemd reports a reload is needed or an environment file is newer than the process. |
 
 The tool does not invoke `sudo`, ask systemd to start or change a unit, write
 files, or make network requests while diagnosing a service.
